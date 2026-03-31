@@ -1,0 +1,139 @@
+name: 🚨 Monitor Claude Code Source Leak
+
+on:
+  schedule:
+    - cron: '0 */1 * * *'     # Run every hour
+  workflow_dispatch:          # Allow manual trigger
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get latest npm version and tarball
+        id: npm
+        run: |
+          LATEST_VERSION=$(npm view @anthropic-ai/claude-code version)
+          TARBALL_URL=$(npm view @anthropic-ai/claude-code dist.tarball)
+          
+          echo "LATEST_VERSION=${LATEST_VERSION}" >> $GITHUB_OUTPUT
+          echo "TARBALL_URL=${TARBALL_URL}" >> $GITHUB_OUTPUT
+          echo "✅ Latest version detected: ${LATEST_VERSION}"
+
+      - name: Read last processed version
+        id: last
+        run: |
+          if [ -f LAST_VERSION ]; then
+            LAST=$(cat LAST_VERSION)
+            echo "LAST_VERSION=${LAST}" >> $GITHUB_OUTPUT
+            echo "📋 Last processed version: ${LAST}"
+          else
+            echo "LAST_VERSION=0.0.0" >> $GITHUB_OUTPUT
+            echo "📋 No previous version found"
+          fi
+
+      - name: Check for new version
+        id: check
+        run: |
+          if [ "${{ steps.npm.outputs.LATEST_VERSION }}" != "${{ steps.last.outputs.LAST_VERSION }}" ]; then
+            echo "NEW_VERSION=true" >> $GITHUB_OUTPUT
+            echo "VERSION=${{ steps.npm.outputs.LATEST_VERSION }}" >> $GITHUB_OUTPUT
+            echo "🚀 New version found: ${{ steps.npm.outputs.LATEST_VERSION }}"
+          else
+            echo "NEW_VERSION=false" >> $GITHUB_OUTPUT
+            echo "✅ Already processed the latest version"
+          fi
+
+      - name: Download package and detect source leak
+        if: steps.check.outputs.NEW_VERSION == 'true'
+        id: detect
+        run: |
+          VERSION="${{ steps.check.outputs.VERSION }}"
+          echo "📥 Downloading @anthropic-ai/claude-code@${VERSION}..."
+
+          curl -L "${{ steps.npm.outputs.TARBALL_URL }}" -o claude-code.tgz
+
+          mkdir -p extracted
+          tar -xzf claude-code.tgz -C extracted --strip-components=1
+
+          # Leak detection
+          LEAK_DETECTED=false
+          SRC_COUNT=0
+          MAP_SIZE=0
+
+          if [ -d "extracted/src" ]; then
+            SRC_COUNT=$(find extracted/src -type f | wc -l)
+          fi
+
+          if [ -f "extracted/cli.js.map" ]; then
+            MAP_SIZE=$(stat -c %s extracted/cli.js.map)
+          fi
+
+          echo "src/ file count: ${SRC_COUNT}"
+          echo "cli.js.map size: ${MAP_SIZE} bytes"
+
+          if [ "$SRC_COUNT" -gt 50 ] || [ "$MAP_SIZE" -gt 10000000 ]; then
+            LEAK_DETECTED=true
+            echo "🔥 Source leak detected!"
+          else
+            echo "🛡️ No significant source leak detected in this version"
+          fi
+
+          # Output for next steps
+          echo "LEAK_DETECTED=${LEAK_DETECTED}" >> $GITHUB_OUTPUT
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+
+          if [ "$LEAK_DETECTED" = "true" ]; then
+            mkdir -p src
+            cp -r extracted/src/* src/ 2>/dev/null || true
+            cp extracted/cli.js.map "cli-${VERSION}.js.map" 2>/dev/null || true
+            
+            ZIP_NAME="claude-code-${VERSION}-src.zip"
+            zip -r "${ZIP_NAME}" src/
+            
+            echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_OUTPUT
+            echo "MAP_NAME=cli-${VERSION}.js.map" >> $GITHUB_OUTPUT
+            echo "📦 Source packaged: ${ZIP_NAME}"
+          fi
+
+      - name: Create GitHub Release (only if leaked)
+        if: steps.detect.outputs.LEAK_DETECTED == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.detect.outputs.VERSION }}-leaked
+          name: Claude Code ${{ steps.detect.outputs.VERSION }} - Full Source Leak
+          body: |
+            **Automatically captured** source code leak from `@anthropic-ai/claude-code@${{ steps.detect.outputs.VERSION }}`
+
+            - Complete `src/` directory (TypeScript sources)
+            - `cli.js.map` source map file
+            - Detected and published by GitHub Action
+
+            **Note**: Anthropic typically patches these leaks quickly. Download ASAP.
+          files: |
+            ${{ steps.detect.outputs.ZIP_NAME }}
+            ${{ steps.detect.outputs.MAP_NAME }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update last processed version
+        if: steps.check.outputs.NEW_VERSION == 'true'
+        run: |
+          echo "${{ steps.check.outputs.VERSION }}" > LAST_VERSION
+          echo "✅ LAST_VERSION updated to ${{ steps.check.outputs.VERSION }}"
+
+      - name: Commit and push LAST_VERSION
+        if: steps.check.outputs.NEW_VERSION == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add LAST_VERSION
+          git commit -m "chore: update last processed version to ${{ steps.check.outputs.VERSION }}" || echo "No changes"
+          git push
