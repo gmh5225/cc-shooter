@@ -1,4 +1,4 @@
-name: 🚨 Monitor Claude Code Source Leak
+name: hello
 
 on:
   schedule:
