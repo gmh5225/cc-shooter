@@ -311,6 +311,43 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Discord notify (new version, no leak)
+        if: ${{ steps.check.outputs.NEW_VERSION == 'true' && steps.extract.outputs.LEAK_DETECTED == 'false' && secrets.DISCORD_WEBHOOK_URL != '' }}
+        run: |
+          VERSION="${{ steps.check.outputs.VERSION }}"
+          TARBALL_URL="${{ steps.npm.outputs.TARBALL_URL }}"
+
+          CONTENT=$(cat <<EOF
+          {
+            "content": "✅ **New Claude Code version released**\\n- Version: \`${VERSION}\`\\n- Status: No map/source leak detected\\n- Tarball: ${TARBALL_URL}"
+          }
+          EOF
+          )
+
+          curl -sS -X POST "${{ secrets.DISCORD_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "${CONTENT}"
+
+      - name: Discord notify (map leak detected)
+        if: ${{ steps.check.outputs.NEW_VERSION == 'true' && steps.extract.outputs.LEAK_DETECTED == 'true' && secrets.DISCORD_WEBHOOK_URL != '' }}
+        run: |
+          VERSION="${{ steps.extract.outputs.VERSION }}"
+          SRC_COUNT="${{ steps.extract.outputs.SRC_FILE_COUNT }}"
+          TOTAL_SIZE="${{ steps.extract.outputs.TOTAL_SIZE }}"
+          TAG="v${VERSION}"
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+
+          CONTENT=$(cat <<EOF
+          {
+            "content": "🚨 **Claude Code map/source leak detected**\\n- Version: \`${VERSION}\`\\n- Source files: ${SRC_COUNT}\\n- Total size: ${TOTAL_SIZE}\\n- Release: ${RELEASE_URL}"
+          }
+          EOF
+          )
+
+          curl -sS -X POST "${{ secrets.DISCORD_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "${CONTENT}"
+
       - name: Update version tracker
         if: steps.check.outputs.NEW_VERSION == 'true'
         run: |
