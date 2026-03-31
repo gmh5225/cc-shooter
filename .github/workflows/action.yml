@@ -57,7 +57,6 @@ jobs:
           echo "📥 Downloading @anthropic-ai/claude-code@${VERSION}..."
 
           curl -L "${{ steps.npm.outputs.TARBALL_URL }}" -o claude-code.tgz
-
           mkdir -p extracted
           tar -xzf claude-code.tgz -C extracted --strip-components=1
 
@@ -67,21 +66,20 @@ jobs:
           MAP_SIZE=0
 
           if [ -d "extracted/src" ]; then
-            SRC_COUNT=$(find extracted/src -type f | wc -l)
+            SRC_COUNT=$(find extracted/src -type f | wc -l || echo 0)
           fi
-
           if [ -f "extracted/cli.js.map" ]; then
-            MAP_SIZE=$(stat -c %s extracted/cli.js.map)
+            MAP_SIZE=$(stat -c %s extracted/cli.js.map 2>/dev/null || echo 0)
           fi
 
-          echo "src/ file count: ${SRC_COUNT}"
+          echo "src/ files: ${SRC_COUNT}"
           echo "cli.js.map size: ${MAP_SIZE} bytes"
 
           if [ "$SRC_COUNT" -gt 50 ] || [ "$MAP_SIZE" -gt 10000000 ]; then
             LEAK_DETECTED=true
             echo "🔥 Source leak detected!"
           else
-            echo "🛡️ No significant source leak detected in this version"
+            echo "🛡️ No source leak detected"
           fi
 
           # Output for next steps
@@ -90,15 +88,43 @@ jobs:
 
           if [ "$LEAK_DETECTED" = "true" ]; then
             mkdir -p src
-            cp -r extracted/src/* src/ 2>/dev/null || true
-            cp extracted/cli.js.map "cli-${VERSION}.js.map" 2>/dev/null || true
-            
+
+            if [ "$SRC_COUNT" -gt 50 ]; then
+              cp -r extracted/src/* src/ 2>/dev/null || true
+              echo "📁 Copied directly from npm src/ directory"
+            else
+              echo "🔧 No src/ folder, extracting from cli.js.map..."
+              node -e '
+                const fs = require("fs");
+                const path = require("path");
+                const map = JSON.parse(fs.readFileSync("extracted/cli.js.map", "utf8"));
+                const outDir = "src";
+                fs.mkdirSync(outDir, { recursive: true });
+                map.sources.forEach((sourcePath, i) => {
+                  const content = map.sourcesContent ? map.sourcesContent[i] : null;
+                  if (!content) return;
+                  let cleanPath = sourcePath
+                    .replace(/^\.\.?\//, "")
+                    .replace(/^src\//, "")
+                    .replace(/^\//, "");
+                  const fullPath = path.join(outDir, cleanPath);
+                  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+                  fs.writeFileSync(fullPath, content, "utf8");
+                });
+                console.log("✅ Extracted " + map.sources.length + " source files from map");
+              '
+              echo "✅ Source map extraction complete"
+            fi
+
+            # Package the extracted sources
             ZIP_NAME="claude-code-${VERSION}-src.zip"
-            zip -r "${ZIP_NAME}" src/
-            
+            zip -r "${ZIP_NAME}" src/ > /dev/null
             echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_OUTPUT
             echo "MAP_NAME=cli-${VERSION}.js.map" >> $GITHUB_OUTPUT
-            echo "📦 Source packaged: ${ZIP_NAME}"
+
+            # Also save the map file
+            cp extracted/cli.js.map "cli-${VERSION}.js.map" 2>/dev/null || true
+            echo "📦 Packaged full source: ${ZIP_NAME}"
           fi
 
       - name: Create GitHub Release (only if leaked)
@@ -110,7 +136,7 @@ jobs:
           body: |
             **Automatically captured** source code leak from `@anthropic-ai/claude-code@${{ steps.detect.outputs.VERSION }}`
 
-            - Complete `src/` directory (TypeScript sources)
+            - Complete `src/` directory (TypeScript sources) — **extracted from map if needed**
             - `cli.js.map` source map file
             - Detected and published by GitHub Action
 
