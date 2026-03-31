@@ -312,8 +312,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Discord notify (new version, no leak)
-        if: ${{ steps.check.outputs.NEW_VERSION == 'true' && steps.extract.outputs.LEAK_DETECTED == 'false' && secrets.DISCORD_WEBHOOK_URL != '' }}
+        if: ${{ steps.check.outputs.NEW_VERSION == 'true' && steps.extract.outputs.LEAK_DETECTED == 'false' }}
         run: |
+          WEBHOOK="${{ secrets.DISCORD_WEBHOOK_URL }}"
+          if [ -z "$WEBHOOK" ]; then
+            echo "No DISCORD_WEBHOOK_URL configured; skipping Discord notification."
+            exit 0
+          fi
+
           VERSION="${{ steps.check.outputs.VERSION }}"
           TARBALL_URL="${{ steps.npm.outputs.TARBALL_URL }}"
 
@@ -324,13 +330,19 @@ jobs:
           EOF
           )
 
-          curl -sS -X POST "${{ secrets.DISCORD_WEBHOOK_URL }}" \
+          curl -sS -X POST "$WEBHOOK" \
             -H "Content-Type: application/json" \
             -d "${CONTENT}"
 
       - name: Discord notify (map leak detected)
-        if: ${{ steps.check.outputs.NEW_VERSION == 'true' && steps.extract.outputs.LEAK_DETECTED == 'true' && secrets.DISCORD_WEBHOOK_URL != '' }}
+        if: ${{ steps.check.outputs.NEW_VERSION == 'true' && steps.extract.outputs.LEAK_DETECTED == 'true' }}
         run: |
+          WEBHOOK="${{ secrets.DISCORD_WEBHOOK_URL }}"
+          if [ -z "$WEBHOOK" ]; then
+            echo "No DISCORD_WEBHOOK_URL configured; skipping Discord notification."
+            exit 0
+          fi
+
           VERSION="${{ steps.extract.outputs.VERSION }}"
           SRC_COUNT="${{ steps.extract.outputs.SRC_FILE_COUNT }}"
           TOTAL_SIZE="${{ steps.extract.outputs.TOTAL_SIZE }}"
@@ -344,7 +356,7 @@ jobs:
           EOF
           )
 
-          curl -sS -X POST "${{ secrets.DISCORD_WEBHOOK_URL }}" \
+          curl -sS -X POST "$WEBHOOK" \
             -H "Content-Type: application/json" \
             -d "${CONTENT}"
 
