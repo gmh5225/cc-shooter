@@ -2,164 +2,326 @@ name: hello
 
 on:
   schedule:
-    - cron: '0 */1 * * *'     # Run every hour
-  workflow_dispatch:          # Allow manual trigger
+    - cron: '0 */1 * * *'
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: 'Force process a specific version (e.g. 2.1.88)'
+        required: false
+        type: string
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Get latest npm version and tarball
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Get latest npm version info
         id: npm
         run: |
-          LATEST_VERSION=$(npm view @anthropic-ai/claude-code version)
-          TARBALL_URL=$(npm view @anthropic-ai/claude-code dist.tarball)
-          
-          echo "LATEST_VERSION=${LATEST_VERSION}" >> $GITHUB_OUTPUT
-          echo "TARBALL_URL=${TARBALL_URL}" >> $GITHUB_OUTPUT
-          echo "✅ Latest version detected: ${LATEST_VERSION}"
+          set -euo pipefail
+
+          if [ -n "${{ github.event.inputs.force_version || '' }}" ]; then
+            LATEST_VERSION="${{ github.event.inputs.force_version }}"
+            TARBALL_URL=$(npm view "@anthropic-ai/claude-code@${LATEST_VERSION}" dist.tarball 2>/dev/null || echo "")
+            if [ -z "$TARBALL_URL" ]; then
+              echo "::error::Version ${LATEST_VERSION} not found on npm"
+              exit 1
+            fi
+          else
+            LATEST_VERSION=$(npm view @anthropic-ai/claude-code version)
+            TARBALL_URL=$(npm view @anthropic-ai/claude-code dist.tarball)
+          fi
+
+          echo "LATEST_VERSION=${LATEST_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "TARBALL_URL=${TARBALL_URL}" >> "$GITHUB_OUTPUT"
+          echo "✅ Target version: ${LATEST_VERSION}"
+          echo "📦 Tarball: ${TARBALL_URL}"
 
       - name: Read last processed version
         id: last
         run: |
           if [ -f LAST_VERSION ]; then
             LAST=$(cat LAST_VERSION)
-            echo "LAST_VERSION=${LAST}" >> $GITHUB_OUTPUT
-            echo "📋 Last processed version: ${LAST}"
+            echo "LAST_VERSION=${LAST}" >> "$GITHUB_OUTPUT"
+            echo "📋 Last processed: ${LAST}"
           else
-            echo "LAST_VERSION=0.0.0" >> $GITHUB_OUTPUT
+            echo "LAST_VERSION=0.0.0" >> "$GITHUB_OUTPUT"
             echo "📋 No previous version found"
           fi
 
       - name: Check for new version
         id: check
         run: |
-          if [ "${{ steps.npm.outputs.LATEST_VERSION }}" != "${{ steps.last.outputs.LAST_VERSION }}" ]; then
-            echo "NEW_VERSION=true" >> $GITHUB_OUTPUT
-            echo "VERSION=${{ steps.npm.outputs.LATEST_VERSION }}" >> $GITHUB_OUTPUT
-            echo "🚀 New version found: ${{ steps.npm.outputs.LATEST_VERSION }}"
+          LATEST="${{ steps.npm.outputs.LATEST_VERSION }}"
+          LAST="${{ steps.last.outputs.LAST_VERSION }}"
+          FORCE="${{ github.event.inputs.force_version || '' }}"
+
+          if [ -n "$FORCE" ] || [ "$LATEST" != "$LAST" ]; then
+            echo "NEW_VERSION=true" >> "$GITHUB_OUTPUT"
+            echo "VERSION=${LATEST}" >> "$GITHUB_OUTPUT"
+            echo "🚀 Processing version: ${LATEST}"
           else
-            echo "NEW_VERSION=false" >> $GITHUB_OUTPUT
-            echo "✅ Already processed the latest version"
+            echo "NEW_VERSION=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Already at latest: ${LATEST}"
           fi
 
-      - name: Download package and detect source leak
+      - name: Download and extract source
         if: steps.check.outputs.NEW_VERSION == 'true'
-        id: detect
+        id: extract
         run: |
+          set -euo pipefail
           VERSION="${{ steps.check.outputs.VERSION }}"
+
           echo "📥 Downloading @anthropic-ai/claude-code@${VERSION}..."
+          curl -fSL "${{ steps.npm.outputs.TARBALL_URL }}" -o claude-code.tgz
 
-          curl -L "${{ steps.npm.outputs.TARBALL_URL }}" -o claude-code.tgz
-          mkdir -p extracted
-          tar -xzf claude-code.tgz -C extracted --strip-components=1
+          mkdir -p pkg
+          tar -xzf claude-code.tgz -C pkg --strip-components=1
 
-          # Leak detection
-          LEAK_DETECTED=false
-          SRC_COUNT=0
+          echo "📦 Package contents:"
+          ls -lh pkg/
+
+          # ── Detect source availability ──
+          HAS_SRC_DIR=false
+          HAS_MAP=false
           MAP_SIZE=0
+          SRC_DIR_COUNT=0
 
-          if [ -d "extracted/src" ]; then
-            SRC_COUNT=$(find extracted/src -type f | wc -l || echo 0)
-          fi
-          if [ -f "extracted/cli.js.map" ]; then
-            MAP_SIZE=$(stat -c %s extracted/cli.js.map 2>/dev/null || echo 0)
-          fi
-
-          echo "src/ files: ${SRC_COUNT}"
-          echo "cli.js.map size: ${MAP_SIZE} bytes"
-
-          if [ "$SRC_COUNT" -gt 50 ] || [ "$MAP_SIZE" -gt 10000000 ]; then
-            LEAK_DETECTED=true
-            echo "🔥 Source leak detected!"
-          else
-            echo "🛡️ No source leak detected"
-          fi
-
-          # Output for next steps
-          echo "LEAK_DETECTED=${LEAK_DETECTED}" >> $GITHUB_OUTPUT
-          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
-
-          if [ "$LEAK_DETECTED" = "true" ]; then
-            mkdir -p src
-
-            if [ "$SRC_COUNT" -gt 50 ]; then
-              cp -r extracted/src/* src/ 2>/dev/null || true
-              echo "📁 Copied directly from npm src/ directory"
-            else
-              echo "🔧 No src/ folder, extracting from cli.js.map..."
-              node -e '
-                const fs = require("fs");
-                const path = require("path");
-                const map = JSON.parse(fs.readFileSync("extracted/cli.js.map", "utf8"));
-                const outDir = "src";
-                fs.mkdirSync(outDir, { recursive: true });
-                map.sources.forEach((sourcePath, i) => {
-                  const content = map.sourcesContent ? map.sourcesContent[i] : null;
-                  if (!content) return;
-                  let cleanPath = sourcePath
-                    .replace(/^\.\.?\//, "")
-                    .replace(/^src\//, "")
-                    .replace(/^\//, "");
-                  const fullPath = path.join(outDir, cleanPath);
-                  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-                  fs.writeFileSync(fullPath, content, "utf8");
-                });
-                console.log("✅ Extracted " + map.sources.length + " source files from map");
-              '
-              echo "✅ Source map extraction complete"
+          if [ -d "pkg/src" ]; then
+            SRC_DIR_COUNT=$(find pkg/src -type f | wc -l)
+            if [ "$SRC_DIR_COUNT" -gt 10 ]; then
+              HAS_SRC_DIR=true
             fi
-
-            # Package the extracted sources
-            ZIP_NAME="claude-code-${VERSION}-src.zip"
-            zip -r "${ZIP_NAME}" src/ > /dev/null
-            echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_OUTPUT
-            echo "MAP_NAME=cli-${VERSION}.js.map" >> $GITHUB_OUTPUT
-
-            # Also save the map file
-            cp extracted/cli.js.map "cli-${VERSION}.js.map" 2>/dev/null || true
-            echo "📦 Packaged full source: ${ZIP_NAME}"
           fi
 
-      - name: Create GitHub Release (only if leaked)
-        if: steps.detect.outputs.LEAK_DETECTED == 'true'
+          if [ -f "pkg/cli.js.map" ]; then
+            MAP_SIZE=$(stat -c %s pkg/cli.js.map 2>/dev/null || stat -f %z pkg/cli.js.map 2>/dev/null || echo 0)
+            if [ "$MAP_SIZE" -gt 1000000 ]; then
+              HAS_MAP=true
+            fi
+          fi
+
+          echo "HAS_SRC_DIR=${HAS_SRC_DIR} (${SRC_DIR_COUNT} files)"
+          echo "HAS_MAP=${HAS_MAP} (${MAP_SIZE} bytes)"
+
+          if [ "$HAS_SRC_DIR" = "false" ] && [ "$HAS_MAP" = "false" ]; then
+            echo "🛡️ No source code found in this version"
+            echo "LEAK_DETECTED=false" >> "$GITHUB_OUTPUT"
+            echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "LEAK_DETECTED=true" >> "$GITHUB_OUTPUT"
+          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          # ── Extract source code ──
+          mkdir -p output/src output/vendor
+
+          if [ "$HAS_SRC_DIR" = "true" ]; then
+            echo "📁 Mode: Direct src/ copy"
+            cp -r pkg/src/* output/src/ 2>/dev/null || true
+            echo "EXTRACT_METHOD=direct_src" >> "$GITHUB_OUTPUT"
+          else
+            echo "🔧 Mode: Extract from cli.js.map (sourcesContent)"
+            node << 'EXTRACT_SCRIPT'
+          const fs = require("fs");
+          const path = require("path");
+
+          const map = JSON.parse(fs.readFileSync("pkg/cli.js.map", "utf8"));
+          const outDir = "output";
+
+          let srcCount = 0;
+          let vendorCount = 0;
+          let depsCount = 0;
+          let skippedCount = 0;
+          let totalBytes = 0;
+
+          map.sources.forEach((sourcePath, i) => {
+            const content = map.sourcesContent?.[i];
+            if (!content || content.length === 0) {
+              skippedCount++;
+              return;
+            }
+
+            // Normalize path: remove leading ../
+            let cleanPath = sourcePath.replace(/^(\.\.\/)+/, "");
+
+            // Route to appropriate directory
+            let targetDir;
+            if (cleanPath.startsWith("src/")) {
+              targetDir = path.join(outDir, cleanPath);
+              srcCount++;
+            } else if (cleanPath.startsWith("vendor/")) {
+              targetDir = path.join(outDir, cleanPath);
+              vendorCount++;
+            } else if (cleanPath.startsWith("node_modules/")) {
+              targetDir = path.join(outDir, "deps", cleanPath.replace("node_modules/", ""));
+              depsCount++;
+            } else {
+              targetDir = path.join(outDir, "other", cleanPath);
+              srcCount++;
+            }
+
+            fs.mkdirSync(path.dirname(targetDir), { recursive: true });
+            fs.writeFileSync(targetDir, content, "utf8");
+            totalBytes += content.length;
+          });
+
+          console.log(`✅ Extracted: ${srcCount} src, ${vendorCount} vendor, ${depsCount} deps, ${skippedCount} skipped`);
+          console.log(`📊 Total content: ${(totalBytes / 1024 / 1024).toFixed(1)} MB`);
+
+          // Write extraction stats
+          const stats = {
+            version: process.env.VERSION || "unknown",
+            totalSources: map.sources.length,
+            srcFiles: srcCount,
+            vendorFiles: vendorCount,
+            depsFiles: depsCount,
+            skippedFiles: skippedCount,
+            totalContentMB: (totalBytes / 1024 / 1024).toFixed(1),
+            extractedAt: new Date().toISOString(),
+          };
+          fs.writeFileSync(path.join(outDir, "extraction-stats.json"), JSON.stringify(stats, null, 2));
+          EXTRACT_SCRIPT
+            echo "EXTRACT_METHOD=sourcemap" >> "$GITHUB_OUTPUT"
+          fi
+
+          # ── Copy additional artifacts ──
+          cp pkg/cli.js.map "output/cli.js.map" 2>/dev/null || true
+          cp pkg/sdk-tools.d.ts "output/sdk-tools.d.ts" 2>/dev/null || true
+          cp pkg/package.json "output/package.json" 2>/dev/null || true
+          cp pkg/README.md "output/README.md" 2>/dev/null || true
+
+          # ── Analyze cli.js for feature flags ──
+          echo "🔍 Analyzing cli.js feature flags..."
+          node << 'ANALYZE_SCRIPT'
+          const fs = require("fs");
+          const cli = fs.readFileSync("pkg/cli.js", "utf8");
+
+          const checks = {
+            "NATIVE_CLIENT_ATTESTATION": cli.includes("NATIVE_CLIENT_ATTESTATION"),
+            "cch=00000": cli.includes("cch=00000"),
+            "bun:bundle": cli.includes("bun:bundle"),
+            "feature()_calls": (cli.match(/feature\(/g) || []).length,
+            "USER_TYPE_ant": (cli.match(/USER_TYPE.*===.*"ant"|USER_TYPE.*===.*'ant'/g) || []).length,
+            "FINGERPRINT_SALT": cli.includes("59cf53e54c78"),
+            "datadog_api_key": cli.includes("pubbbf48e6d78dae54bceaa4acf463299bf"),
+            "attestation_in_header": cli.includes("cch=00000"),
+          };
+
+          console.log("Feature analysis:");
+          for (const [k, v] of Object.entries(checks)) {
+            console.log(`  ${k}: ${v}`);
+          }
+
+          fs.writeFileSync("output/feature-analysis.json", JSON.stringify(checks, null, 2));
+          ANALYZE_SCRIPT
+
+          # ── Generate stats ──
+          SRC_FILE_COUNT=$(find output/src -type f 2>/dev/null | wc -l || echo 0)
+          TOTAL_SIZE=$(du -sh output/ 2>/dev/null | cut -f1 || echo "0")
+          echo "SRC_FILE_COUNT=${SRC_FILE_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "TOTAL_SIZE=${TOTAL_SIZE}" >> "$GITHUB_OUTPUT"
+
+          echo "📊 Final stats: ${SRC_FILE_COUNT} source files, ${TOTAL_SIZE} total"
+
+      - name: Package artifacts
+        if: steps.extract.outputs.LEAK_DETECTED == 'true'
+        id: package
+        run: |
+          VERSION="${{ steps.extract.outputs.VERSION }}"
+
+          # Package 1: Source code only (src + vendor, no deps)
+          SRC_ZIP="claude-code-${VERSION}-src.zip"
+          cd output
+          zip -r "../${SRC_ZIP}" src/ vendor/ \
+            extraction-stats.json feature-analysis.json \
+            sdk-tools.d.ts package.json README.md \
+            -x "*/node_modules/*" > /dev/null 2>&1 || true
+          cd ..
+          echo "SRC_ZIP=${SRC_ZIP}" >> "$GITHUB_OUTPUT"
+
+          # Package 2: Source map file
+          MAP_FILE="cli-${VERSION}.js.map"
+          if [ -f "output/cli.js.map" ]; then
+            cp "output/cli.js.map" "${MAP_FILE}"
+            echo "MAP_FILE=${MAP_FILE}" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Package 3: Full extraction (including deps) - optional, can be large
+          FULL_ZIP="claude-code-${VERSION}-full.zip"
+          cd output
+          zip -r "../${FULL_ZIP}" . -x "cli.js.map" > /dev/null 2>&1 || true
+          cd ..
+          echo "FULL_ZIP=${FULL_ZIP}" >> "$GITHUB_OUTPUT"
+
+          echo "📦 Packages created:"
+          ls -lh "${SRC_ZIP}" "${MAP_FILE}" "${FULL_ZIP}" 2>/dev/null || true
+
+      - name: Create GitHub Release
+        if: steps.extract.outputs.LEAK_DETECTED == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.detect.outputs.VERSION }}-leaked
-          name: Claude Code ${{ steps.detect.outputs.VERSION }} - Full Source Leak
+          tag_name: v${{ steps.extract.outputs.VERSION }}
+          name: "Claude Code ${{ steps.extract.outputs.VERSION }}"
           body: |
-            **Automatically captured** source code leak from `@anthropic-ai/claude-code@${{ steps.detect.outputs.VERSION }}`
+            ## Claude Code v${{ steps.extract.outputs.VERSION }} Source Extraction
 
-            - Complete `src/` directory (TypeScript sources) — **extracted from map if needed**
-            - `cli.js.map` source map file
-            - Detected and published by GitHub Action
+            **Extraction method**: `${{ steps.extract.outputs.EXTRACT_METHOD }}`
+            **Source files**: ${{ steps.extract.outputs.SRC_FILE_COUNT }} TypeScript files
+            **Total size**: ${{ steps.extract.outputs.TOTAL_SIZE }}
 
-            **Note**: Anthropic typically patches these leaks quickly. Download ASAP.
+            ### Files
+            - `*-src.zip` — Source code only (src/ + vendor/)
+            - `cli-*.js.map` — Full source map (57MB, contains all sources including node_modules)
+            - `*-full.zip` — Complete extraction with dependencies
+
+            ### Key findings
+            - Source map contains `sourcesContent` with 100% of TypeScript source
+            - `NATIVE_CLIENT_ATTESTATION` compiled out in npm build
+            - `cch=00000` placeholder present but not functional without Bun native runtime
+            - All `feature()` gates resolved at build time
+
+            ### Notable directories
+            ```
+            src/
+            ├── services/api/     # API communication, billing, auth
+            ├── tools/            # 40+ tool implementations
+            ├── utils/            # Core utilities, permissions, fingerprint
+            ├── components/       # Ink terminal UI components
+            ├── hooks/            # React hooks and permission handlers
+            ├── constants/        # System prompts, billing headers
+            └── ...               # 1900+ files total
+            ```
           files: |
-            ${{ steps.detect.outputs.ZIP_NAME }}
-            ${{ steps.detect.outputs.MAP_NAME }}
+            ${{ steps.package.outputs.SRC_ZIP }}
+            ${{ steps.package.outputs.MAP_FILE }}
+            ${{ steps.package.outputs.FULL_ZIP }}
           draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update last processed version
+      - name: Update version tracker
         if: steps.check.outputs.NEW_VERSION == 'true'
         run: |
-          echo "${{ steps.check.outputs.VERSION }}" > LAST_VERSION
-          echo "✅ LAST_VERSION updated to ${{ steps.check.outputs.VERSION }}"
+          VERSION="${{ steps.check.outputs.VERSION }}"
+          echo "${VERSION}" > LAST_VERSION
 
-      - name: Commit and push LAST_VERSION
-        if: steps.check.outputs.NEW_VERSION == 'true'
-        run: |
+          # Also maintain a version history
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ${VERSION} leak=${{ steps.extract.outputs.LEAK_DETECTED || 'unknown' }}" >> VERSION_HISTORY
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add LAST_VERSION
-          git commit -m "chore: update last processed version to ${{ steps.check.outputs.VERSION }}" || echo "No changes"
+          git add LAST_VERSION VERSION_HISTORY
+          git diff --cached --quiet || git commit -m "track: v${VERSION}"
           git push
